@@ -9,4 +9,3 @@ joblib==1.3.2
 gunicorn==22.0.0
 textblob==0.18.0.post0
 NRCLex==4.0
-
