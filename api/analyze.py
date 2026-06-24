@@ -1,6 +1,7 @@
 """
 Vercel Serverless Function – /api/analyze
 Replaces the Flask backend for Vercel deployment.
+Removed SHAP to satisfy Vercel 250MB limit.
 """
 
 import json
@@ -45,8 +46,6 @@ if PROJECT_ROOT not in sys.path:
 # Lazy-loaded heavy imports (cached across warm invocations)
 # ---------------------------------------------------------------------------
 _model = None
-_explainer = None
-
 
 def _get_model():
     global _model
@@ -57,22 +56,6 @@ def _get_model():
             raise RuntimeError(f"Model file not found at '{model_path}'.")
         _model = joblib.load(model_path)
     return _model
-
-
-def _predict_proba_wrapped(texts):
-    """Wrapper so the trained pipeline (which expects 2D input) works with SHAP."""
-    model = _get_model()
-    X = [[t] for t in texts]
-    return model.predict_proba(X)
-
-
-def _get_explainer():
-    global _explainer
-    if _explainer is None:
-        import shap
-        _explainer = shap.Explainer(_predict_proba_wrapped, shap.maskers.Text(r"\W+"))
-    return _explainer
-
 
 def get_review_type(text, prob_fake):
     """Simple heuristic to categorize review character."""
@@ -93,7 +76,6 @@ def get_review_type(text, prob_fake):
         return "Highly Suspicious"
     else:
         return "Authentic / Genuine"
-
 
 # ---------------------------------------------------------------------------
 # Vercel handler
@@ -117,8 +99,10 @@ class handler(BaseHTTPRequestHandler):
             from textblob import TextBlob
             from nrclex import NRCLex
 
+            model = _get_model()
+
             # 1. Base Fake/Real Prediction
-            proba = _predict_proba_wrapped([review_text])[0]
+            proba = model.predict_proba([[review_text]])[0]
             prob_fake = float(proba[1])
             prediction = "Fake" if prob_fake >= 0.5 else "Real"
 
@@ -146,12 +130,26 @@ class handler(BaseHTTPRequestHandler):
             # 4. Review Type (Heuristic)
             review_type = get_review_type(review_text, prob_fake)
 
-            # 5. SHAP Explanations
-            explainer = _get_explainer()
-            shap_values_obj = explainer([review_text])
-            tokens = shap_values_obj.data[0].tolist()
-            values = shap_values_obj.values[0][:, 1].tolist()
-            base_value = float(shap_values_obj.base_values[0][1])
+            # 5. Native Linear Explanations (Replaces SHAP)
+            import re
+            tfidf_transformer = model.named_steps['features'].named_transformers_['tfidf']
+            classifier = model.named_steps['clf']
+
+            vocab = getattr(tfidf_transformer, "vocabulary_", {})
+            coefs = classifier.coef_[0]
+            base_value = float(classifier.intercept_[0])
+
+            tokens = re.findall(r"\w+|\W+", review_text)
+            explanation = []
+
+            for token in tokens:
+                word = token.lower()
+                score = 0.0
+                if word in vocab:
+                    idx = vocab[word]
+                    # Multiply coefficient by an approximate factor to match UI scale
+                    score = float(coefs[idx]) * 0.2
+                explanation.append((token, score))
 
             self._respond(200, {
                 "success": True,
@@ -160,7 +158,7 @@ class handler(BaseHTTPRequestHandler):
                 "sentiment": sentiment,
                 "emotion": friendly_emotion,
                 "type": review_type,
-                "explanation": list(zip(tokens, values)),
+                "explanation": explanation,
                 "base_value": base_value,
             })
 
