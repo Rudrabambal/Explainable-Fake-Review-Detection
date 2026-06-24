@@ -1,12 +1,13 @@
 """
 Vercel Serverless Function – /api/analyze
-Replaces the Flask backend for Vercel deployment.
-Removed SHAP to satisfy Vercel 250MB limit.
+Pure Python Implementation without Scikit-Learn to guarantee < 250MB deployment size.
 """
 
 import json
 import os
 import sys
+import re
+import math
 from http.server import BaseHTTPRequestHandler
 
 # ---------------------------------------------------------------------------
@@ -35,50 +36,128 @@ for folder, name in REQUIRED_NLTK_DATA:
     except LookupError:
         nltk.download(name, download_dir=NLTK_DATA_DIR, quiet=True)
 
-# ---------------------------------------------------------------------------
-# Add project root to sys.path so we can import features / preprocessing
-# ---------------------------------------------------------------------------
+from nltk import pos_tag, word_tokenize
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+from nltk.sentiment import SentimentIntensityAnalyzer
+
+_STOPWORDS = set(stopwords.words("english"))
+_LEMMATIZER = WordNetLemmatizer()
+_SIA = SentimentIntensityAnalyzer()
+
+_MARKETING_WORDS = {
+    "best", "amazing", "incredible", "fantastic", "perfect",
+    "highly", "recommend", "unbelievable", "life-changing", "must-buy", "must-try",
+}
+
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
 
 # ---------------------------------------------------------------------------
-# Lazy-loaded heavy imports (cached across warm invocations)
+# Load the pre-extracted JSON Model parameters
 # ---------------------------------------------------------------------------
-_model = None
+_model_params = None
 
-def _get_model():
-    global _model
-    if _model is None:
-        import joblib
-        model_path = os.path.join(PROJECT_ROOT, "models", "fake_review_model.joblib")
-        if not os.path.exists(model_path):
-            raise RuntimeError(f"Model file not found at '{model_path}'.")
-        _model = joblib.load(model_path)
-    return _model
+def get_model_params():
+    global _model_params
+    if _model_params is None:
+        path = os.path.join(PROJECT_ROOT, "models", "model_params.json")
+        with open(path, "r", encoding="utf-8") as f:
+            _model_params = json.load(f)
+    return _model_params
+
+# ---------------------------------------------------------------------------
+# Preprocessing & Pure-Python TF-IDF Engine
+# ---------------------------------------------------------------------------
+def simple_preprocess(text: str) -> str:
+    tokens = nltk.word_tokenize(text)
+    cleaned = []
+    for t in tokens:
+        t_low = t.lower()
+        if t_low.isalpha() and t_low not in _STOPWORDS:
+            cleaned.append(_LEMMATIZER.lemmatize(t_low))
+    return " ".join(cleaned)
+
+def compute_tfidf(text: str, vocab: dict, idf: list):
+    # Scikit-learn default token pattern
+    tokens = re.findall(r"(?u)\b\w\w+\b", text)
+    
+    # 1-grams and 2-grams
+    ngrams = list(tokens)
+    for i in range(len(tokens) - 1):
+        ngrams.append(tokens[i] + " " + tokens[i+1])
+        
+    tf = {}
+    for ng in ngrams:
+        tf[ng] = tf.get(ng, 0) + 1
+        
+    vec = {}
+    for ng, count in tf.items():
+        if ng in vocab:
+            idx = vocab[ng]
+            vec[idx] = count * idf[idx]
+            
+    norm = math.sqrt(sum(v*v for v in vec.values()))
+    if norm > 0:
+        for idx in vec:
+            vec[idx] /= norm
+    return vec
+
+# ---------------------------------------------------------------------------
+# Linguistic Features Engine
+# ---------------------------------------------------------------------------
+def compute_linguistic_features(text: str):
+    tokens = word_tokenize(text)
+    token_count = len(tokens)
+    chars = len(text)
+    words = [t for t in tokens if any(c.isalpha() for c in t)]
+
+    review_length = token_count
+    avg_word_length = (sum(len(w) for w in words) / len(words)) if words else 0.0
+    exclamation_count = text.count("!")
+    capital_chars = sum(1 for c in text if c.isupper())
+    capital_ratio = (capital_chars / chars) if chars > 0 else 0.0
+    sentiment_score = _SIA.polarity_scores(text)["compound"]
+
+    tagged = pos_tag(tokens) if tokens else []
+    adj_count = sum(1 for _, tag in tagged if tag.startswith("JJ"))
+    adjective_ratio = (adj_count / token_count) if token_count > 0 else 0.0
+
+    adv_count = sum(1 for _, tag in tagged if tag.startswith("RB"))
+    adverb_ratio = (adv_count / token_count) if token_count > 0 else 0.0
+
+    pronoun_tags = {"PRP", "PRP$", "WP", "WP$"}
+    pronoun_count = sum(1 for _, tag in tagged if tag in pronoun_tags)
+
+    word_tokens = [w.lower() for w in words]
+    unique_word_ratio = (len(set(word_tokens)) / len(word_tokens)) if word_tokens else 0.0
+
+    stop_count = sum(1 for w in word_tokens if w in _STOPWORDS)
+    stopword_ratio = (stop_count / len(word_tokens)) if word_tokens else 0.0
+
+    punctuation_count = len(re.findall(r"[^\w\s]", text))
+    marketing_word_count = sum(1 for w in word_tokens if w in _MARKETING_WORDS)
+
+    return [
+        float(review_length), float(avg_word_length), float(exclamation_count), float(capital_ratio),
+        float(sentiment_score), float(adjective_ratio), float(adverb_ratio), float(pronoun_count),
+        float(unique_word_ratio), float(stopword_ratio), float(punctuation_count), float(marketing_word_count),
+    ]
 
 def get_review_type(text, prob_fake):
-    """Simple heuristic to categorize review character."""
     promo_keywords = ['buy', 'discount', 'limited', 'click', 'exclusive', 'offer', 'price', 'deal', 'promo', 'sales']
     spam_keywords = ['cash', 'win', 'money', 'free', 'opportunity', 'income', 'earn']
-
     words = text.lower().split()
     promo_count = sum(1 for w in words if w in promo_keywords)
     spam_count = sum(1 for w in words if w in spam_keywords)
-
     if prob_fake > 0.7:
-        if promo_count > 1:
-            return "Promotional / Commercial"
-        if spam_count > 0:
-            return "Potential Spam"
+        if promo_count > 1: return "Promotional / Commercial"
+        if spam_count > 0: return "Potential Spam"
         return "Deceptive / Fake"
-    elif prob_fake > 0.4:
-        return "Highly Suspicious"
-    else:
-        return "Authentic / Genuine"
+    elif prob_fake > 0.4: return "Highly Suspicious"
+    else: return "Authentic / Genuine"
 
 # ---------------------------------------------------------------------------
-# Vercel handler
+# Vercel HTTP Handler
 # ---------------------------------------------------------------------------
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -99,24 +178,34 @@ class handler(BaseHTTPRequestHandler):
             from textblob import TextBlob
             from nrclex import NRCLex
 
-            model = _get_model()
+            params = get_model_params()
+            vocab = params['vocab']
+            idf = params['idf']
+            coef = params['coef']
+            intercept = params['intercept']
 
-            # 1. Base Fake/Real Prediction
-            proba = model.predict_proba([[review_text]])[0]
-            prob_fake = float(proba[1])
+            # 1. Feature Extraction (Pure Python)
+            preprocessed_text = simple_preprocess(review_text)
+            tfidf_vec = compute_tfidf(preprocessed_text, vocab, idf)
+            ling_features = compute_linguistic_features(review_text)
+
+            # 2. Logistic Regression Math
+            logit = intercept
+            for idx, val in tfidf_vec.items():
+                logit += val * coef[idx]
+            
+            vocab_size = len(vocab)
+            for i, val in enumerate(ling_features):
+                logit += val * coef[vocab_size + i]
+
+            prob_fake = 1.0 / (1.0 + math.exp(-logit))
             prediction = "Fake" if prob_fake >= 0.5 else "Real"
 
-            # 2. Sentiment Analysis (TextBlob)
+            # 3. Sentiment & Emotion Analysis
             blob = TextBlob(review_text)
             polarity = blob.sentiment.polarity
-            if polarity > 0.1:
-                sentiment = "Positive"
-            elif polarity < -0.1:
-                sentiment = "Negative"
-            else:
-                sentiment = "Neutral"
+            sentiment = "Positive" if polarity > 0.1 else ("Negative" if polarity < -0.1 else "Neutral")
 
-            # 3. Emotion Analysis (NRCLex)
             emotion_obj = NRCLex(review_text)
             emotions = emotion_obj.top_emotions
             top_emotion = emotions[0][0] if emotions else "Neutral"
@@ -127,18 +216,7 @@ class handler(BaseHTTPRequestHandler):
             }
             friendly_emotion = emotion_map.get(top_emotion, top_emotion.capitalize())
 
-            # 4. Review Type (Heuristic)
-            review_type = get_review_type(review_text, prob_fake)
-
-            # 5. Native Linear Explanations (Replaces SHAP)
-            import re
-            tfidf_transformer = model.named_steps['features'].named_transformers_['tfidf']
-            classifier = model.named_steps['clf']
-
-            vocab = getattr(tfidf_transformer, "vocabulary_", {})
-            coefs = classifier.coef_[0]
-            base_value = float(classifier.intercept_[0])
-
+            # 4. Native Linear Explanations
             tokens = re.findall(r"\w+|\W+", review_text)
             explanation = []
 
@@ -147,8 +225,7 @@ class handler(BaseHTTPRequestHandler):
                 score = 0.0
                 if word in vocab:
                     idx = vocab[word]
-                    # Multiply coefficient by an approximate factor to match UI scale
-                    score = float(coefs[idx]) * 0.2
+                    score = float(coef[idx]) * 0.2
                 explanation.append((token, score))
 
             self._respond(200, {
@@ -157,9 +234,9 @@ class handler(BaseHTTPRequestHandler):
                 "confidence": prob_fake * 100 if prediction == "Fake" else (1 - prob_fake) * 100,
                 "sentiment": sentiment,
                 "emotion": friendly_emotion,
-                "type": review_type,
+                "type": get_review_type(review_text, prob_fake),
                 "explanation": explanation,
-                "base_value": base_value,
+                "base_value": intercept,
             })
 
         except Exception as e:
@@ -168,7 +245,7 @@ class handler(BaseHTTPRequestHandler):
             self._respond(500, {"success": False, "error": str(e)})
 
     def do_GET(self):
-        self._respond(200, {"status": "ok", "message": "Fake Review Detection API is running."})
+        self._respond(200, {"status": "ok", "message": "Fake Review Detection API is running (Pure Python)."})
 
     def _respond(self, status_code, payload):
         self.send_response(status_code)
